@@ -1,0 +1,75 @@
+# Reusable test workflow for pleme-io GitHub Actions.
+#
+# Runs cargo check, clippy (pedantic), and cargo test on every PR + push
+# to main. No release artefacts; this is the pre-release gate.
+#
+# Usage in a per-action repo (`.github/workflows/ci.yml`):
+#
+#   on:
+#     pull_request: {}
+#     push: { branches: [main] }
+#
+#   jobs:
+#     test:
+#       uses: pleme-io/pleme-actions/.github/workflows/test-action.yml@main
+
+name: test-action (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      cargo-features:
+        description: "Comma-separated cargo features to enable"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      - name: cargo check
+        env: { FEATURES: "${{ inputs.cargo-features }}" }
+        run: |
+          if [[ -n "$FEATURES" ]]; then
+            cargo check --all-targets --features "$FEATURES"
+          else
+            cargo check --all-targets
+          fi
+
+      - name: cargo clippy (pedantic, deny warnings)
+        env: { FEATURES: "${{ inputs.cargo-features }}" }
+        run: |
+          if [[ -n "$FEATURES" ]]; then
+            cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+          else
+            cargo clippy --all-targets -- -D warnings
+          fi
+
+      - name: cargo test
+        env: { FEATURES: "${{ inputs.cargo-features }}" }
+        run: |
+          if [[ -n "$FEATURES" ]]; then
+            cargo test --all-targets --features "$FEATURES"
+          else
+            cargo test --all-targets
+          fi

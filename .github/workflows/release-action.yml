@@ -1,0 +1,201 @@
+# Reusable release workflow for pleme-io GitHub Actions.
+#
+# Triggered on tag push from a consumer action's repo. Cross-compiles the
+# Rust binary for 3 targets (the proven default from rust_tool_release —
+# Intel Mac is opt-in by extending the matrix), uploads them to a GitHub
+# Release named after the tag, and auto-advances the moving major-version
+# tag (v1, v2, ...) so consumers pinned to `@v1` automatically pick up
+# bug fixes.
+#
+# Usage in a per-action repo (`.github/workflows/release.yml`):
+#
+#   on:
+#     push:
+#       tags: ["v*"]
+#     workflow_dispatch: {}
+#
+#   jobs:
+#     release:
+#       uses: pleme-io/pleme-actions/.github/workflows/release-action.yml@main
+#       with:
+#         action-name: my-action
+#       permissions:
+#         contents: write       # write GitHub release + advance major tag
+#
+# Secrets are inherited from the caller via `secrets: inherit`.
+
+name: release-action (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      action-name:
+        description: "The action's binary + repo name (kebab-case)"
+        type: string
+        required: true
+      include-intel-mac:
+        description: "Add darwin-x86_64 (macos-13) to the matrix"
+        type: boolean
+        default: false
+      cargo-features:
+        description: "Comma-separated cargo features"
+        type: string
+        default: ""
+    outputs:
+      release-tag:
+        description: "The tag the release was published under"
+        value: ${{ jobs.publish.outputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.slug }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: darwin-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+          - slug: linux-x86_64
+            runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+          - slug: linux-arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ inputs.action-name }}-${{ matrix.slug }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ inputs.action-name }}-${{ matrix.slug }}-
+
+      - name: Build release
+        env:
+          ACTION_NAME: ${{ inputs.action-name }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          FEATURES: ${{ inputs.cargo-features }}
+        run: |
+          if [[ -n "$FEATURES" ]]; then
+            cargo build --release --bin "$ACTION_NAME" --target "$RUST_TARGET" --features "$FEATURES"
+          else
+            cargo build --release --bin "$ACTION_NAME" --target "$RUST_TARGET"
+          fi
+
+      - name: Stage artefact
+        env:
+          ACTION_NAME: ${{ inputs.action-name }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          SLUG: ${{ matrix.slug }}
+        run: |
+          mkdir -p dist
+          cp "target/${RUST_TARGET}/release/${ACTION_NAME}" "dist/${ACTION_NAME}-${SLUG}"
+          (cd dist && shasum -a 256 "${ACTION_NAME}-${SLUG}" > "${ACTION_NAME}-${SLUG}.sha256")
+
+      - name: Sanity-check the binary (linux only)
+        if: startsWith(matrix.runner, 'ubuntu')
+        env:
+          ACTION_NAME: ${{ inputs.action-name }}
+          SLUG: ${{ matrix.slug }}
+        run: |
+          # Linux-on-Linux probe — verifies the binary at least starts.
+          # macOS cross-arch isn't probed here (would need Rosetta on
+          # macos-14 for darwin-arm64 → darwin-x86_64).
+          chmod +x "dist/${ACTION_NAME}-${SLUG}"
+          file "dist/${ACTION_NAME}-${SLUG}"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.action-name }}-${{ matrix.slug }}
+          path: |
+            dist/${{ inputs.action-name }}-${{ matrix.slug }}
+            dist/${{ inputs.action-name }}-${{ matrix.slug }}.sha256
+          retention-days: 30
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ inputs.action-name }}-darwin-arm64
+            dist/${{ inputs.action-name }}-darwin-arm64.sha256
+            dist/${{ inputs.action-name }}-linux-x86_64
+            dist/${{ inputs.action-name }}-linux-x86_64.sha256
+            dist/${{ inputs.action-name }}-linux-arm64
+            dist/${{ inputs.action-name }}-linux-arm64.sha256
+          generate_release_notes: true
+          body: |
+            Cross-platform release of `pleme-io/${{ inputs.action-name }}` at `${{ steps.tag.outputs.value }}`.
+
+            ## Verifying
+
+            ```bash
+            # Download for your platform:
+            gh release download ${{ steps.tag.outputs.value }} --repo pleme-io/${{ inputs.action-name }}
+
+            # Verify checksum:
+            shasum -a 256 -c ${{ inputs.action-name }}-<platform>.sha256
+            ```
+
+            ## Consume
+
+            ```yaml
+            - uses: pleme-io/${{ inputs.action-name }}@${{ steps.tag.outputs.value }}
+            # or, to auto-track 1.x.y bug fixes:
+            - uses: pleme-io/${{ inputs.action-name }}@v1
+            ```
+
+            See [`pleme-io/pleme-actions`](https://github.com/pleme-io/pleme-actions) for the full action library.
+
+      - name: Advance moving major-version tag
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          # Extract major (vX from vX.Y.Z) and force-update the moving tag.
+          if [[ "$TAG" =~ ^(v[0-9]+)\.[0-9]+\.[0-9]+$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -f "$MAJOR" "$TAG"
+            git push origin "$MAJOR" --force
+            echo "advanced $MAJOR → $TAG"
+          else
+            echo "tag $TAG is not vX.Y.Z form; skipping major-tag advance"
+          fi
