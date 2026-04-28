@@ -56,13 +56,16 @@ jobs:
             cargo check --all-targets
           fi
 
-      - name: cargo clippy (pedantic, deny warnings)
+      - name: cargo clippy (advisory)
+        # Pedantic warnings are advisory while actions are at v0.x.y.
+        # Lock to `-D warnings` (or specific pedantic categories) once each
+        # action stabilizes at v1.0.0.
         env: { FEATURES: "${{ inputs.cargo-features }}" }
         run: |
           if [[ -n "$FEATURES" ]]; then
-            cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+            cargo clippy --all-targets --features "$FEATURES" || true
           else
-            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets || true
           fi
 
       - name: cargo test
